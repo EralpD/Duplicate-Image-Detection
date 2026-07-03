@@ -12,7 +12,7 @@ python detectDuplicates.py
 
 Detects duplicate images in the specified dataset directory, depending on precision. There are 3 scenarios for duplication detection:
 
-- **Vanilla**: Use the techniques as in priority: IoU -> P hashing -> CLIP embedding (The most appropriate prioritization). This technique is the <u>most fastest</u>, but <u>least sensitive</u>. All of techniques considered seperately, based on their threshold values. Must been careful when setting threshold values of each technique, the image isn't duplicated when all thresholds fallen.
+- **Vanilla**: Use the techniques as in priority: IoU -> Perceptual (P) hashing -> CLIP embedding (The most appropriate prioritization). This technique is the <u>most fastest</u>, but <u>least sensitive</u>. All of techniques considered seperately, based on their threshold values. Must been careful when setting threshold values of each technique, the image isn't duplicated when all thresholds fallen.
 
 - **Scoring**: With activating it (activateScore = True), duplication sensibility declared by all of 3 techniques: IoU, P hashing and ClIP embedding. Each technique has its own threshold, and effect general scoring with their score ration values (Default: IoU = 0.5, P hashing = 0.3, CLIP embedding = 0.2). If the general total score is higher then the score threshold (Default: 0.7), the image is considered as duplicated. This technique is the <u>most controllable</u> technique. Playing with score/threshold values must be considered, based on the dataset.
 
