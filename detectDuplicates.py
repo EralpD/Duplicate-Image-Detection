@@ -5,7 +5,7 @@ import torch
 import cv2
 from PIL import Image
 import os
-import lpips
+# import lpips
 import torchvision.transforms as T
 from tqdm import tqdm
 import shutil
