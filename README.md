@@ -46,4 +46,4 @@ For example; 1, 3,4, 5, 6
 
 ### Results & Conclusion:
 
-The results are satisfying for some datasets, but for more sensitiveness required datasets although, the 3rd option must be done. Although the 3rd option is not done yet, an interpretation can be done as identified duplicates with most aggressive 2nd option is showing that the kinda similar images are not adding any uniqueness/effectiveness to remember the path to classify the exact disaease type.
+The results are satisfying for some datasets, but for more sensitiveness required datasets although; more sensitive settings must be setted up. If the images are detected as duplicate of each of them, they must seperate with manually. With all settings setted up appropriately, the results are satisfying enough.
