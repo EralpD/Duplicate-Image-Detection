@@ -9,6 +9,16 @@ import lpips
 import torchvision.transforms as T
 from tqdm import tqdm
 import shutil
+import argparse
+
+
+try:
+    from pytorch_msssim import ssim
+    PT_SSIM_AVAILABLE = True
+except ImportError:
+    from skimage.metrics import structural_similarity as compare_ssim 
+    print("pytorch_msssim is not installed, or GPU not been available. Please install it using 'pip install pytorch-msssim'.")
+    PT_SSIM_AVAILABLE = False
 
 class UnionFind:
     def __init__(self, n):
@@ -133,35 +143,111 @@ def compute_iou_matrix(masks):
 
     return iou
 
-def compute_lpips_matrix(images, model, device, transform):
-    n = len(images)
-    sims = np.zeros((n, n), dtype=np.float32)
+# def compute_lpips_matrix(images, model, device, transform):
+#     n = len(images)
+#     sims = np.zeros((n, n), dtype=np.float32)
 
+#     tensors = []
+
+#     for img in images:
+
+#         if isinstance(img, np.ndarray):
+#             if img.shape[-1] == 4:
+#                 img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+#             img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+#         else:
+#             img = img.convert("RGB")
+
+#         t = transform(img).to(device)
+#         tensors.append(t)
+
+#     with torch.no_grad():
+#         for i in range(n):
+#             for j in range(i + 1, n):
+
+#                 d = model(
+#                     tensors[i].unsqueeze(0),
+#                     tensors[j].unsqueeze(0)
+#                 )
+
+#                 sims[i, j] = sims[j, i] = d.item()
+
+#     return sims
+
+def compute_ssim_matrix_gpu(images, device):
+    n = len(images)
     tensors = []
+    for img in images:
+        if not isinstance(img, np.ndarray):
+            img = np.array(img)
+        # 1 kanallı gri tonlamaya çevirip normalize ediyoruz
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
+        gray = cv2.resize(gray, (256, 256))
+        tensors.append(torch.tensor(gray, dtype=torch.float32) / 255.0)
+    
+    # Batch formatı: [N, 1, 256, 256]
+    batch = torch.stack(tensors).unsqueeze(1).to(device)
+    
+    if PT_SSIM_AVAILABLE:
+        # GPU üzerinde vektörize SSIM matrisi (Deneysel & Çok Hızlı)
+        ssim_matrix = torch.eye(n, device=device)
+        with torch.no_grad():
+            for i in tqdm(range(n), desc="Computing SSIM matrix"):
+                # i. görseli tüm görsellerle tek seferde karşılaştır
+                img_i = batch[i:i+1].expand(n, -1, -1, -1)
+                # ssim fonksiyonu batch bazlı çalışabilir (size_average=False ile her çift için skor döner)
+                scores = ssim(img_i, batch, data_range=1.0, size_average=False)
+                ssim_matrix[i] = scores
+        return ssim_matrix
+    else:
+        # pytorch-msssim yoksa eski CPU yöntemine mecburen geri döner
+        sims = np.zeros((n, n), dtype=np.float32)
+        resized = [t.cpu().numpy() for t in tensors]
+        for i in tqdm(range(n), desc="Computing SSIM matrix"):
+            sims[i, i] = 1.0
+            for j in range(i + 1, n):
+                s = compare_ssim(resized[i], resized[j], data_range=1.0)
+                sims[i, j] = sims[j, i] = s
+        return torch.tensor(sims, device=device)
+    
+def build_orb_descriptors(images):
+    orb = cv2.ORB_create(nfeatures=256)
+    descriptors = []
 
     for img in images:
+        arr = _to_numpy(img)
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        _, des = orb.detectAndCompute(gray, None)
+        descriptors.append(des)
 
-        if isinstance(img, np.ndarray):
-            if img.shape[-1] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return descriptors
 
-            img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        else:
-            img = img.convert("RGB")
+def compute_orb_similarity_matrix(descriptors):
+    n = len(descriptors)
+    sims = np.zeros((n, n), dtype=np.float32)
 
-        t = transform(img).to(device)
-        tensors.append(t)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    with torch.no_grad():
-        for i in range(n):
-            for j in range(i + 1, n):
+    for i in tqdm(range(n), desc="Computing ORB matrix"):
+        sims[i, i] = 1.0
 
-                d = model(
-                    tensors[i].unsqueeze(0),
-                    tensors[j].unsqueeze(0)
-                )
+        for j in range(i + 1, n):
+            des1 = descriptors[i]
+            des2 = descriptors[j]
 
-                sims[i, j] = sims[j, i] = d.item()
+            if des1 is None or des2 is None:
+                sim = 0
+            else:
+                matches = bf.match(des1, des2)
+
+                if len(matches) == 0:
+                    sim = 0
+                else:
+                    good = [m for m in matches if m.distance < 32]
+                    sim = len(good) / max(len(des1), len(des2))
+
+            sims[i, j] = sims[j, i] = sim
 
     return sims
 
@@ -173,19 +259,19 @@ def detect_duplicates(
     clip_model,
     preprocess,
     device,
-    iou_threshold=1.2, #.95
-    phash_threshold=-1, #5
-    clip_threshold=1.0, #.95
-    activateScore=False,
-    scoreThreshold=.7, # Available when activateScore is True
-    iou_ratio=0.45, # .5, Available when activateScore is True
-    phash_ratio=0.35, # .3, Available when activateScore is True
+    iou_threshold=0.95, 
+    phash_threshold=5,
+    clip_threshold=0.97,
+    activateScore=True,
+    scoreThreshold=1, # Available when activateScore is True
+    iou_ratio=0.4, # .5, Available when activateScore is True
+    phash_ratio=0.4, # .3, Available when activateScore is True
     clip_ratio=0.2, # .2, Available when activateScore is True
-    activateLPSIS=False, # Available when activateScore is True 
-    lpsis_model=None, # Available when activateLPSIS is True
-    lpips_transform=None, # Available when activateLPSIS is True
-    lpsis_ratio=.3, # Available when activateLPSIS is True
-    verbose=False
+    activateSSIM=True, # Available when activateScore is True
+    ssim_ratio=0.3, # Available when activateSSIM is True
+    activateORB=True, # Available when activateScore is True
+    orb_ratio=0.2, # Available when activateORB is True
+    verbose=True 
 ):
     n = len(images)
     uf = UnionFind(n)
@@ -201,8 +287,11 @@ def detect_duplicates(
     iou_matrix = compute_iou_matrix(masks)
     clip_matrix = compute_clip_similarity_matrix(embeddings)
     phash_matrix = compute_phash_matrix(phashes)
-    if activateScore and activateLPSIS:
-        lpips_matrix = compute_lpips_matrix(images, lpsis_model, device, lpips_transform)
+    if activateScore and activateSSIM:
+        ssim_matrix = compute_ssim_matrix_gpu(images, device)
+    if activateScore and activateORB:
+        orb_descriptors = build_orb_descriptors(images)
+        orb_matrix = compute_orb_similarity_matrix(orb_descriptors)
 
     n = len(images)
 
@@ -213,23 +302,24 @@ def detect_duplicates(
                 iou_s = iou_matrix[i, j]
                 phash_s = normalize_phash(phash_matrix[i, j])
                 clip_s = clip_matrix[i, j]
-                if activateLPSIS:
-                    lpips_s = 1.0 - lpips_matrix[i, j]
+                if activateSSIM:
+                    ssim_s = ssim_matrix[i, j]
+                if activateScore and activateORB:
+                    orb_s = orb_matrix[i, j] if activateORB else 0
 
                 score = (
-                    iou_ratio * iou_s +
-                    phash_ratio * phash_s +
-                    clip_ratio * clip_s
-                ) if not activateLPSIS else (
-                    (iou_ratio - lpsis_ratio/3) * iou_s +
-                    (phash_ratio - lpsis_ratio/3) * phash_s +
-                    (clip_ratio - lpsis_ratio/3) * clip_s +
-                    lpsis_ratio * lpips_s
+                    (iou_ratio-ssim_ratio/3 if activateSSIM else iou_ratio) * iou_s +
+                    (phash_ratio-ssim_ratio/3 if activateSSIM else phash_ratio) * phash_s +
+                    (clip_ratio-ssim_ratio/3 if activateSSIM else clip_ratio) * clip_s +
+                    (ssim_ratio * ssim_s if activateSSIM else 0)
                 )
+
+                if activateORB:
+                    score = score * (1 - orb_ratio) + orb_s * orb_ratio
 
                 if score >= scoreThreshold:
                     if verbose:
-                        print(f"[SCORE] {i},{j} = {score:.4f};  (IOU: {iou_s:.4f}, pHash: {phash_s:.4f}, CLIP: {clip_s:.4f}, {f'LPIPS: {lpips_s:.4f}' if activateLPSIS else ''})")
+                        print(f"[SCORE] {i},{j} = {score:.4f};  (IOU: {iou_s:.4f}, pHash: {phash_s:.4f}, CLIP: {clip_s:.4f}, {f'SSIM: {ssim_s:.4f}' if activateSSIM else ''}, {f'ORB: {orb_s:.4f}' if activateORB else ''})")
                     uf.union(i, j)
 
             else:
@@ -294,6 +384,37 @@ def save_clusters(lock, clusters, output_dir="exact_images"):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--dir_path", type=str)
+
+    parser.add_argument("--iou_threshold", type=float, default=0.95)
+    parser.add_argument("--phash_threshold", type=int, default=5)
+    parser.add_argument("--clip_threshold", type=float, default=0.97)
+
+    parser.add_argument("--activateScore", type=lambda x: x.lower() == "true", default=True)
+    parser.add_argument("--scoreThreshold", type=float, default=.9)
+
+    parser.add_argument("--iou_ratio", type=float, default=0.4)
+    parser.add_argument("--phash_ratio", type=float, default=0.4)
+    parser.add_argument("--clip_ratio", type=float, default=0.2)
+
+    parser.add_argument("--activateSSIM", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--ssim_ratio", type=float, default=0.3)
+
+    parser.add_argument("--activateORB", type=lambda x: x.lower() == "true", default=False)
+    parser.add_argument("--orb_ratio", type=float, default=0.2)
+
+    parser.add_argument("--verbose", type=lambda x: x.lower() == "true", default=True)
+
+    args = parser.parse_args()
+
+    if not args.dir_path:
+        raise ValueError("Please provide a valid directory path using --dir_path argument.")
+    
+
+
     model, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-B-32",
         pretrained="laion2b_s34b_b79k"
@@ -301,16 +422,16 @@ if __name__ == "__main__":
     model.to(device)
     model.eval()
 
-    lpips_model = lpips.LPIPS(net='vgg').to(device)
+    # lpips_model = lpips.LPIPS(net='vgg').to(device)
 
-    lpips_transform = T.Compose([
-    T.Resize((256, 256)),
-    T.ToTensor(),
-    T.Normalize((0.5, 0.5, 0.5),
-                (0.5, 0.5, 0.5))  # -> [-1,1]
-    ])
+    # lpips_transform = T.Compose([
+    # T.Resize((256, 256)),
+    # T.ToTensor(),
+    # T.Normalize((0.5, 0.5, 0.5),
+    #             (0.5, 0.5, 0.5))  # -> [-1,1]
+    # ])
 
-    dir_path = "Open Comedones_test2"
+    dir_path = args.dir_path
     images = [Image.open(os.path.join(dir_path, file)) for file in os.listdir(dir_path) if file.endswith((".jpg", ".png", ".jpeg"))]
 
     clusters = detect_duplicates(
@@ -318,19 +439,19 @@ if __name__ == "__main__":
         model,
         preprocess,
         device,
-        iou_threshold=.95, #.95
-        phash_threshold=5, #5
-        clip_threshold=.97, #.95
-        activateScore=True,
-        scoreThreshold=.9, # Available when activateScore is True
-        iou_ratio=0.4, # .5, Available when activateScore is True
-        phash_ratio=0.4, # .3, Available when activateScore is True
-        clip_ratio=0.2, # .2, Available when activateScore is True
-        activateLPSIS=False, # Available when activateScore is True 
-        lpsis_ratio=.3, # Available when activateLPSIS is True
-        lpsis_model=lpips_model, # None, Available when activateLPSIS is True
-        lpips_transform=lpips_transform, # None, Available when activateLPSIS is True
-        verbose=True,
+        iou_threshold=args.iou_threshold,
+        phash_threshold=args.phash_threshold,
+        clip_threshold=args.clip_threshold,
+        activateScore=args.activateScore,
+        scoreThreshold=args.scoreThreshold,
+        iou_ratio=args.iou_ratio,
+        phash_ratio=args.phash_ratio,
+        clip_ratio=args.clip_ratio,
+        activateSSIM=args.activateSSIM,
+        ssim_ratio=args.ssim_ratio,
+        activateORB=args.activateORB,
+        orb_ratio=args.orb_ratio,
+        verbose=args.verbose,
     )
 
     print(clusters)

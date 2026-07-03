@@ -1,7 +1,15 @@
 import cv2
 import os
+import argparse
 
-dir_path = "Open Comedones_test2"
+parser = argparse.ArgumentParser()
+parser.add_argument("--dir_path", type=str, required=True, help="Path to the directory containing images")
+args = parser.parse_args()
+
+if args.dir_path:
+    dir_path = args.dir_path
+else:
+    raise ValueError("Please provide a valid directory path using --dir_path argument.")
 
 def display_images(lst, idxs, window_name="Images"):
     idxs = list(idxs)
